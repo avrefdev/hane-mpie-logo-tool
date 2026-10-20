@@ -1,94 +1,133 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class LogoTool
 {
     const string InputFolder = "PUT_YOUR_LOGO_HERE";
     const string BackupFolder = "backups";
     const string PreviewFolder = "preview";
+    const string BaseResource = "hane_mpie_base";
+    const string YtdRelative = @"stream\custom_texture\ch1_11_blgs01.ytd";
+    const string TextureName = "hane_mpie_logo";
     static readonly string[] ImageExtensions = { ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff" };
 
-    public static int Run(string mode, string toolDir)
+    class Location
+    {
+        public string Key, Name, Folder;
+        public string[] Resources;
+        public Location(string key, string name, string folder, params string[] resources)
+        { Key = key; Name = name; Folder = folder; Resources = resources; }
+    }
+
+    static readonly Location[] Locations = {
+        new Location("greatocean", "Great Ocean Highway", "[Hane_MPie_GreatOcean]", "hane_data_greatocean", "hane_mpie_greatocean"),
+        new Location("delperro",   "Del Perro",           "[Hane_MPie_DelPerro]",   "hane_data_delperro",   "hane_mpie_delperro"),
+        new Location("vespucci",   "Vespucci Canals",     "[Hane_Mpie_Vespucci]",   "hane_data_vespucci",   "hane_mpie_vespucci"),
+    };
+
+    class Context
+    {
+        public string ToolDir, BasePath, YtdPath, ResourcesRoot, ServerCfg;
+        public Dictionary<string, string> Settings, State;
+        public Dictionary<string, string> FoundResources;
+        public List<Location> Selected = new List<Location>();
+    }
+
+    class ToolException : Exception { public ToolException(string m) : base(m) { } }
+    class CancelException : Exception { }
+
+    public static int Run(string mode, string toolDir, string locationArg)
     {
         try
         {
-            Dictionary<string, string> settings = LoadSettings(Path.Combine(toolDir, "settings.ini"));
-            string ytdPath = Path.GetFullPath(Path.Combine(toolDir, Setting(settings, "YtdPath", @"..\stream\custom_texture\ch1_11_blgs01.ytd")));
-            string texName = Setting(settings, "TextureName", "hane_mpie_logo");
-            if (!File.Exists(ytdPath))
-                throw new ToolException("Texture file not found:\n  " + ytdPath +
-                    "\nMake sure the logo_tool folder is inside the hane_mpie_base resource folder," +
-                    "\nor set the correct YtdPath in settings.ini.");
+            Context ctx = new Context();
+            ctx.ToolDir = toolDir;
+            ctx.Settings = LoadIni(Path.Combine(toolDir, "settings.ini"));
+            ctx.State = LoadIni(StatePath(toolDir));
 
-            if (mode == "restore") return Restore(toolDir, ytdPath);
-            return Replace(toolDir, ytdPath, texName, settings);
+            Header(mode == "restore" ? 3 : 4, 1, "Finding the Mom's Pie files");
+            FindBase(ctx);
+            Ok("Found " + BaseResource + ": " + ctx.BasePath);
+            ctx.ResourcesRoot = FindResourcesRoot(ctx.BasePath);
+            ctx.FoundResources = FindResources(ctx.ResourcesRoot);
+            ctx.ServerCfg = FindServerCfg(ctx.ResourcesRoot);
+            SaveState(ctx);
+
+            if (mode == "restore") return Restore(ctx, locationArg);
+            return Replace(ctx, locationArg);
+        }
+        catch (CancelException)
+        {
+            Console.WriteLine();
+            Info("Cancelled. Nothing was changed.");
+            return 2;
         }
         catch (ToolException e)
         {
+            Console.WriteLine();
             Error(e.Message);
             return 1;
         }
         catch (Exception e)
         {
+            Console.WriteLine();
             Error("Unexpected error: " + e.Message + "\n" + e.StackTrace);
             return 1;
         }
     }
 
-    class ToolException : Exception { public ToolException(string m) : base(m) { } }
-
-    static int Replace(string toolDir, string ytdPath, string texName, Dictionary<string, string> settings)
+    static int Replace(Context ctx, string locationArg)
     {
-        string mode = Setting(settings, "Mode", "Fit").ToLowerInvariant();
+        string mode = Setting(ctx.Settings, "Mode", "Fit").ToLowerInvariant();
         if (mode != "fit" && mode != "fill" && mode != "stretch")
             throw new ToolException("Invalid Mode in settings.ini: \"" + mode + "\". Use Fit, Fill or Stretch.");
         double margin;
-        if (!double.TryParse(Setting(settings, "Margin", "0"), NumberStyles.Float, CultureInfo.InvariantCulture, out margin) || margin < 0 || margin > 45)
+        if (!double.TryParse(Setting(ctx.Settings, "Margin", "0"), NumberStyles.Float, CultureInfo.InvariantCulture, out margin) || margin < 0 || margin > 45)
             throw new ToolException("Invalid Margin in settings.ini. Use a number between 0 and 45.");
 
-        string inputDir = Path.Combine(toolDir, InputFolder);
-        Directory.CreateDirectory(inputDir);
-        List<FileInfo> images = new List<FileInfo>();
-        foreach (FileInfo f in new DirectoryInfo(inputDir).GetFiles())
-            if (Array.IndexOf(ImageExtensions, f.Extension.ToLowerInvariant()) >= 0) images.Add(f);
-        if (images.Count == 0)
-            throw new ToolException("No image found in the " + InputFolder + " folder.\n" +
-                "Put your logo there (PNG with a transparent background is recommended) and run ReplaceLogo.bat again.\n" +
-                "Supported formats: " + string.Join(", ", ImageExtensions));
-        images.Sort(delegate (FileInfo a, FileInfo b) { return b.LastWriteTimeUtc.CompareTo(a.LastWriteTimeUtc); });
-        FileInfo input = images[0];
-        if (images.Count > 1)
-            Warn("Found " + images.Count + " images in " + InputFolder + ". Using the most recently modified one: " + input.Name);
+        Header(4, 2, "Choose your location");
+        ChooseLocation(ctx, locationArg);
+        SaveState(ctx);
 
-        Step("Reading image: " + input.Name);
+        Header(4, 3, "Choose your image");
+        FileInfo input = WaitForImage(ctx.ToolDir);
         int srcW, srcH;
         bool hasTransparency;
         float[] src = LoadImagePremul(input.FullName, out srcW, out srcH, out hasTransparency);
-        Info("  Size: " + srcW + "x" + srcH);
+        Ok("Image: " + input.Name + " (" + srcW + "x" + srcH + ")");
         if (!hasTransparency)
             Warn("This image has no transparent background. The whole image (including its background)\n" +
                  "  will be visible on the sign. For best results use a PNG with a transparent background.");
 
-        Step("Reading texture file: " + Path.GetFileName(ytdPath));
-        Ytd ytd = ReadYtd(ytdPath);
-        Tex tex = FindTexture(ytd, texName);
+        Ytd ytd = ReadYtd(ctx.YtdPath);
+        Tex tex = FindTexture(ytd, TextureName);
         int W = tex.W, H = tex.H;
+        bool needsResize = !(srcW == W && srcH == H && margin == 0);
 
+        Console.WriteLine();
+        Write(ConsoleColor.White, "Ready to replace the sign logo:");
+        Info("  Location : " + SelectedNames(ctx));
+        Info("  Image    : " + input.Name);
+        Info("  Size     : " + (needsResize
+            ? srcW + "x" + srcH + " -> converted to " + W + "x" + H + " (mode: " + mode + ", margin: " + margin.ToString(CultureInfo.InvariantCulture) + "%)"
+            : W + "x" + H + " (already the right size, no conversion needed)"));
+        Info("  File     : " + ctx.YtdPath);
+        if (!AskYesNo("Continue?")) throw new CancelException();
+
+        Header(4, 4, "Replacing the logo");
         float[] canvas;
-        if (srcW == W && srcH == H && margin == 0)
-        {
-            Step("Image is already " + W + "x" + H + ", no resizing needed.");
-            canvas = src;
-        }
+        if (!needsResize) canvas = src;
         else
         {
-            Step("Converting " + srcW + "x" + srcH + " -> " + W + "x" + H + " (mode: " + mode + ", margin: " + margin.ToString(CultureInfo.InvariantCulture) + "%)");
+            Step("Converting " + srcW + "x" + srcH + " -> " + W + "x" + H + "...");
             canvas = BuildCanvas(src, srcW, srcH, W, H, mode, margin);
         }
 
@@ -111,63 +150,508 @@ public static class LogoTool
         }
         if (pos != tex.Size) throw new ToolException("Internal error: encoded size " + pos + " != " + tex.Size);
 
-        string backupDir = Path.Combine(toolDir, BackupFolder);
+        Step("Backing up the current file...");
+        string backupDir = Path.Combine(ctx.ToolDir, BackupFolder);
         Directory.CreateDirectory(backupDir);
-        string original = Path.Combine(backupDir, "ORIGINAL_" + Path.GetFileName(ytdPath) + ".bak");
+        string original = OriginalBackupPath(ctx);
         if (!File.Exists(original))
         {
-            File.Copy(ytdPath, original);
-            Info("  Original file saved to: " + original);
+            File.Copy(ctx.YtdPath, original);
+            Info("  Original Mom's Pie logo saved: " + original);
         }
-        string backup = Path.Combine(backupDir, Path.GetFileName(ytdPath) + "." + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".bak");
-        File.Copy(ytdPath, backup, true);
+        string backup = Path.Combine(backupDir, Path.GetFileName(ctx.YtdPath) + "." + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".bak");
+        File.Copy(ctx.YtdPath, backup, true);
 
-        Step("Writing new logo into " + Path.GetFileName(ytdPath));
+        Step("Writing the new logo...");
         Buffer.BlockCopy(encoded, 0, ytd.Data, tex.Offset, encoded.Length);
-        WriteYtd(ytdPath, ytd);
+        try { WriteYtd(ctx.YtdPath, ytd); }
+        catch (IOException e)
+        {
+            throw new ToolException("Could not write the texture file: " + e.Message +
+                "\nIf the server or another program (OpenIV, CodeWalker) has the file open, close it and try again.");
+        }
 
-        Ytd check = ReadYtd(ytdPath);
-        Tex t2 = FindTexture(check, texName);
+        Step("Verifying...");
+        Ytd check = ReadYtd(ctx.YtdPath);
+        Tex t2 = FindTexture(check, TextureName);
         for (int i = 0; i < encoded.Length; i++)
             if (check.Data[t2.Offset + i] != encoded[i])
             {
-                File.Copy(backup, ytdPath, true);
+                File.Copy(backup, ctx.YtdPath, true);
                 throw new ToolException("Verification failed, the previous file was restored.");
             }
 
-        string previewDir = Path.Combine(toolDir, PreviewFolder);
+        string previewDir = Path.Combine(ctx.ToolDir, PreviewFolder);
         Directory.CreateDirectory(previewDir);
         byte[] decoded = DecodeDxt5(check.Data, t2.Offset, W, H);
         string previewDark = Path.Combine(previewDir, "logo_preview_on_dark.png");
-        string preview512 = Path.Combine(previewDir, "logo_512x512.png");
-        SavePng(preview512, decoded, W, H, false);
+        SavePng(Path.Combine(previewDir, "logo_512x512.png"), decoded, W, H, false);
         SavePng(previewDark, decoded, W, H, true);
 
         Console.WriteLine();
-        Success("DONE! The sign logo was replaced successfully.");
-        Info("  Source image : " + input.Name + " (" + srcW + "x" + srcH + ")");
-        Info("  Texture      : " + tex.Name + " " + W + "x" + H + " DXT5, " + tex.Levels + " mips");
-        Info("  Backup       : " + backup);
-        Info("  Preview      : " + previewDark);
-        Console.WriteLine();
-        Info("Next steps: restart the resource (\"restart hane_mpie_base\" or restart the server).");
-        Info("If you still see the old logo in game, clear your FiveM cache.");
-        Info("To undo, run RestoreOriginalLogo.bat");
+        Success("==================================================================");
+        Success("  DONE! The Mom's Pie sign logo was replaced successfully.");
+        Success("==================================================================");
+        Info("  Location : " + SelectedNames(ctx));
+        Info("  Image    : " + input.Name + " (" + srcW + "x" + srcH + ")");
+        Info("  Preview  : " + previewDark);
+        Info("  Backup   : " + backup);
+        NextSteps(ctx, false);
         return 0;
     }
 
-    static int Restore(string toolDir, string ytdPath)
+    static int Restore(Context ctx, string locationArg)
     {
-        string original = Path.Combine(Path.Combine(toolDir, BackupFolder), "ORIGINAL_" + Path.GetFileName(ytdPath) + ".bak");
+        Header(3, 2, "Checking the backup");
+        string original = OriginalBackupPath(ctx);
         if (!File.Exists(original))
-            throw new ToolException("No original backup found. The logo has never been replaced with this tool.");
-        File.Copy(original, ytdPath, true);
-        Success("The original logo was restored.");
-        Info("Restart the resource (\"restart hane_mpie_base\") to see the change in game.");
+            throw new ToolException("No original backup was found for this server, so the logo has never been\n" +
+                "replaced with this tool. Nothing to restore.");
+        Ok("Original backup found: " + original);
+        ctx.Selected.AddRange(SelectedFromState(ctx, locationArg));
+
+        Header(3, 3, "Restoring the original logo");
+        try { File.Copy(original, ctx.YtdPath, true); }
+        catch (IOException e)
+        {
+            throw new ToolException("Could not write the texture file: " + e.Message +
+                "\nIf the server or another program (OpenIV, CodeWalker) has the file open, close it and try again.");
+        }
+        Console.WriteLine();
+        Success("==================================================================");
+        Success("  DONE! The original Mom's Pie logo was restored.");
+        Success("==================================================================");
+        NextSteps(ctx, true);
         return 0;
     }
 
-    static Dictionary<string, string> LoadSettings(string path)
+    static bool IsBase(string dir)
+    {
+        return !string.IsNullOrEmpty(dir) && File.Exists(Path.Combine(dir, YtdRelative));
+    }
+
+    static void FindBase(Context ctx)
+    {
+        List<string> candidates = new List<string>();
+        candidates.Add(Setting(ctx.Settings, "BasePath", ""));
+        candidates.Add(Setting(ctx.State, "BasePath", ""));
+        candidates.Add(Path.Combine(ctx.ToolDir, ".."));
+        foreach (string c in candidates)
+        {
+            if (c.Length == 0) continue;
+            string full = Path.GetFullPath(Path.IsPathRooted(c) ? c : Path.Combine(ctx.ToolDir, c));
+            if (IsBase(full)) { SetBase(ctx, full); return; }
+        }
+
+        DirectoryInfo d = new DirectoryInfo(ctx.ToolDir);
+        for (int i = 0; i < 8 && d != null; i++, d = d.Parent)
+        {
+            string root = null;
+            if (d.Name.Equals("resources", StringComparison.OrdinalIgnoreCase)) root = d.FullName;
+            else if (Directory.Exists(Path.Combine(d.FullName, "resources"))) root = Path.Combine(d.FullName, "resources");
+            if (root == null) continue;
+            string found = SearchBase(root);
+            if (found != null) { SetBase(ctx, found); return; }
+        }
+
+        Warn("The " + BaseResource + " folder could not be found automatically.");
+        Info("  This happens when the logo_tool folder is not inside your server's resources.");
+        Console.WriteLine();
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            Write(ConsoleColor.White, "Drag & drop your \"" + BaseResource + "\" folder (or your server's \"resources\" folder)");
+            Write(ConsoleColor.White, "into this window and press Enter. Type Q to quit.");
+            string line = Prompt("> ");
+            if (line == null || line.Trim().Equals("q", StringComparison.OrdinalIgnoreCase)) throw new CancelException();
+            string p = line.Trim().Trim('"').Trim();
+            if (p.Length == 0) continue;
+            if (File.Exists(p) && p.EndsWith(".ytd", StringComparison.OrdinalIgnoreCase))
+            {
+                DirectoryInfo up = new DirectoryInfo(p).Parent;
+                if (up != null && up.Parent != null && up.Parent.Parent != null) p = up.Parent.Parent.FullName;
+            }
+            if (IsBase(p)) { SetBase(ctx, Path.GetFullPath(p)); return; }
+            if (Directory.Exists(p))
+            {
+                Step("Searching in " + p + " ...");
+                string found = SearchBase(p);
+                if (found != null) { SetBase(ctx, found); return; }
+            }
+            Warn("\"" + BaseResource + "\" was not found there. Please try again.\n" +
+                 "  It is the folder that contains: " + YtdRelative);
+        }
+        throw new ToolException("Could not find the " + BaseResource + " folder.\n" +
+            "Copy the logo_tool folder into your " + BaseResource + " resource folder and run it again.");
+    }
+
+    static void SetBase(Context ctx, string dir)
+    {
+        ctx.BasePath = Path.GetFullPath(dir).TrimEnd('\\');
+        ctx.YtdPath = Path.Combine(ctx.BasePath, YtdRelative);
+    }
+
+    static string SearchBase(string root)
+    {
+        foreach (string dir in WalkDirs(root, 6))
+            if (Path.GetFileName(dir).Equals(BaseResource, StringComparison.OrdinalIgnoreCase) && IsBase(dir)) return dir;
+        return null;
+    }
+
+    static IEnumerable<string> WalkDirs(string root, int maxDepth)
+    {
+        Queue<KeyValuePair<string, int>> q = new Queue<KeyValuePair<string, int>>();
+        q.Enqueue(new KeyValuePair<string, int>(root, 0));
+        int visited = 0;
+        while (q.Count > 0 && visited++ < 30000)
+        {
+            KeyValuePair<string, int> cur = q.Dequeue();
+            string[] subs;
+            try { subs = Directory.GetDirectories(cur.Key); }
+            catch (Exception) { continue; }
+            foreach (string s in subs)
+            {
+                string name = Path.GetFileName(s);
+                if (name.StartsWith(".") || name.Equals("stream", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("node_modules", StringComparison.OrdinalIgnoreCase)) continue;
+                yield return s;
+                if (cur.Value + 1 < maxDepth) q.Enqueue(new KeyValuePair<string, int>(s, cur.Value + 1));
+            }
+        }
+    }
+
+    static string FindResourcesRoot(string basePath)
+    {
+        for (DirectoryInfo d = new DirectoryInfo(basePath); d != null; d = d.Parent)
+            if (d.Name.Equals("resources", StringComparison.OrdinalIgnoreCase)) return d.FullName;
+        DirectoryInfo p = new DirectoryInfo(basePath).Parent;
+        return p == null ? basePath : (p.Parent != null ? p.Parent.FullName : p.FullName);
+    }
+
+    static Dictionary<string, string> FindResources(string root)
+    {
+        HashSet<string> wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Location l in Locations) foreach (string r in l.Resources) wanted.Add(r);
+        Dictionary<string, string> found = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string dir in WalkDirs(root, 6))
+        {
+            string name = Path.GetFileName(dir);
+            if (wanted.Contains(name) && !found.ContainsKey(name) &&
+                (File.Exists(Path.Combine(dir, "fxmanifest.lua")) || File.Exists(Path.Combine(dir, "__resource.lua"))))
+                found[name] = dir;
+        }
+        return found;
+    }
+
+    static bool Installed(Context ctx, Location l)
+    {
+        foreach (string r in l.Resources) if (!ctx.FoundResources.ContainsKey(r)) return false;
+        return true;
+    }
+
+    static void ChooseLocation(Context ctx, string locationArg)
+    {
+        string last = Setting(ctx.State, "LastLocation", "");
+        string answer = string.IsNullOrEmpty(locationArg) ? null : locationArg;
+        if (answer == null)
+        {
+            Write(ConsoleColor.White, "Which Mom's Pie location does your server use?");
+            Console.WriteLine();
+            for (int i = 0; i < Locations.Length; i++)
+            {
+                Console.Write("  [" + (i + 1) + "] " + Locations[i].Name.PadRight(22));
+                if (Installed(ctx, Locations[i])) Write(ConsoleColor.Green, "installed");
+                else Write(ConsoleColor.DarkGray, "not found on this server");
+            }
+            Console.WriteLine("  [" + (Locations.Length + 1) + "] More than one location (all installed ones)");
+            Console.WriteLine("  [Q] Quit");
+            Console.WriteLine();
+            string lastName = LocationNames(last);
+            if (lastName != null) Info("Press Enter to use your last choice: " + lastName);
+        }
+
+        for (int attempt = 0; ; attempt++)
+        {
+            string line = answer ?? Prompt("Type a number and press Enter: ");
+            answer = null;
+            if (line == null) throw new CancelException();
+            line = line.Trim();
+            if (line.Equals("q", StringComparison.OrdinalIgnoreCase)) throw new CancelException();
+            if (line.Length == 0 && LocationNames(last) != null) line = last;
+
+            List<Location> sel = ParseLocations(line);
+            if (sel == null)
+            {
+                if (attempt >= 9) throw new CancelException();
+                Warn("Please type a number from 1 to " + (Locations.Length + 1) + ", or Q to quit.");
+                continue;
+            }
+            if (sel.Count == Locations.Length)
+            {
+                List<Location> inst = sel.FindAll(delegate (Location l) { return Installed(ctx, l); });
+                if (inst.Count > 0) sel = inst;
+            }
+            ctx.Selected = sel;
+            break;
+        }
+        Ok("Location: " + SelectedNames(ctx));
+
+        List<string> missing = new List<string>();
+        foreach (Location l in ctx.Selected)
+            foreach (string r in l.Resources)
+                if (!ctx.FoundResources.ContainsKey(r)) missing.Add(r + "   (from the " + l.Folder + " folder)");
+        Console.WriteLine();
+        if (missing.Count > 0)
+        {
+            Warn("These resources for your location were not found in your resources folder:");
+            foreach (string m in missing) Write(ConsoleColor.Yellow, "    - " + m);
+            Info("  The logo can still be replaced, but the sign only shows up in game when the");
+            Info("  location's resources are installed and started.");
+            Info("  Searched in: " + ctx.ResourcesRoot);
+            if (!AskYesNo("Continue anyway?")) throw new CancelException();
+        }
+        else
+        {
+            foreach (Location l in ctx.Selected)
+                foreach (string r in l.Resources)
+                    Ok(r + " found");
+        }
+
+        Console.WriteLine();
+        Write(ConsoleColor.White, "Good to know:");
+        Info("  The sign logo is stored in " + BaseResource + " and shared by all Mom's Pie locations.");
+        Info("  If your server runs more than one location, all of them will show the new logo.");
+    }
+
+    static List<Location> ParseLocations(string text)
+    {
+        List<Location> res = new List<Location>();
+        foreach (string partRaw in text.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string part = partRaw.Trim().ToLowerInvariant();
+            int n;
+            if (int.TryParse(part, out n))
+            {
+                if (n == Locations.Length + 1) { res.Clear(); res.AddRange(Locations); return res; }
+                if (n < 1 || n > Locations.Length) return null;
+                if (!res.Contains(Locations[n - 1])) res.Add(Locations[n - 1]);
+                continue;
+            }
+            if (part == "all") { res.Clear(); res.AddRange(Locations); return res; }
+            Location match = null;
+            foreach (Location l in Locations) if (l.Key == part) match = l;
+            if (match == null) return null;
+            if (!res.Contains(match)) res.Add(match);
+        }
+        return res.Count > 0 ? res : null;
+    }
+
+    static string LocationNames(string keys)
+    {
+        if (string.IsNullOrEmpty(keys)) return null;
+        List<Location> l = ParseLocations(keys);
+        if (l == null) return null;
+        List<string> names = new List<string>();
+        foreach (Location x in l) names.Add(x.Name);
+        return string.Join(" + ", names);
+    }
+
+    static string SelectedNames(Context ctx)
+    {
+        if (ctx.Selected.Count == 0) return "all Mom's Pie locations";
+        if (ctx.Selected.Count == Locations.Length) return "all locations (" + string.Join(", ", Array.ConvertAll(Locations, l => l.Name)) + ")";
+        List<string> names = new List<string>();
+        foreach (Location l in ctx.Selected) names.Add(l.Name);
+        return string.Join(" + ", names);
+    }
+
+    static List<Location> SelectedFromState(Context ctx, string locationArg)
+    {
+        List<Location> l = ParseLocations(string.IsNullOrEmpty(locationArg) ? Setting(ctx.State, "LastLocation", "") : locationArg);
+        if (l != null) return l;
+        l = new List<Location>();
+        foreach (Location x in Locations) if (Installed(ctx, x)) l.Add(x);
+        return l;
+    }
+
+    static FileInfo WaitForImage(string toolDir)
+    {
+        string inputDir = Path.Combine(toolDir, InputFolder);
+        Directory.CreateDirectory(inputDir);
+        for (int attempt = 0; ; attempt++)
+        {
+            List<FileInfo> images = new List<FileInfo>();
+            foreach (FileInfo f in new DirectoryInfo(inputDir).GetFiles())
+                if (Array.IndexOf(ImageExtensions, f.Extension.ToLowerInvariant()) >= 0) images.Add(f);
+            if (images.Count > 0)
+            {
+                images.Sort(delegate (FileInfo a, FileInfo b) { return b.LastWriteTimeUtc.CompareTo(a.LastWriteTimeUtc); });
+                if (images.Count > 1)
+                    Warn("Found " + images.Count + " images in " + InputFolder + ". Using the newest one: " + images[0].Name +
+                         "\n  (Remove the other images from the folder if this is not the one you want.)");
+                return images[0];
+            }
+
+            if (attempt == 0)
+            {
+                Warn("No image found in the " + InputFolder + " folder.");
+                Info("  1. Copy your logo image into this folder:");
+                Write(ConsoleColor.White, "       " + inputDir);
+                Info("     Supported: PNG, JPG, BMP, GIF, TIFF. A PNG with a transparent background works best.");
+                Info("     Any size is fine, it is converted to 512x512 automatically.");
+                Info("  2. Come back to this window and press Enter.");
+                if (!Console.IsInputRedirected)
+                {
+                    try { Process.Start("explorer.exe", "\"" + inputDir + "\""); Info("  (The folder was opened for you.)"); }
+                    catch (Exception) { }
+                }
+            }
+            else Warn("Still no image in " + InputFolder + ". Supported: " + string.Join(", ", ImageExtensions));
+            string line = Prompt("Press Enter when your image is in the folder, or type Q to quit: ");
+            if (line == null || line.Trim().Equals("q", StringComparison.OrdinalIgnoreCase)) throw new CancelException();
+        }
+    }
+
+    static void NextSteps(Context ctx, bool restored)
+    {
+        List<string> needed = new List<string>();
+        needed.Add(BaseResource);
+        foreach (Location l in ctx.Selected) foreach (string r in l.Resources) needed.Add(r);
+        string where = ctx.Selected.Count == 1 ? "the Mom's Pie at " + ctx.Selected[0].Name : "your Mom's Pie location";
+
+        Console.WriteLine();
+        Write(ConsoleColor.White, "WHAT TO DO NOW");
+        Write(ConsoleColor.White, "--------------");
+
+        Write(ConsoleColor.White, "1. Make sure these resources are started by your server:");
+        List<string> cfgLines = ServerCfgEnsures(ctx);
+        bool allOk = true, notInstalled = false;
+        foreach (string r in needed)
+        {
+            string by = cfgLines == null ? null : EnsuredBy(ctx, r, cfgLines);
+            if (r != BaseResource && !ctx.FoundResources.ContainsKey(r))
+            {
+                Write(ConsoleColor.Yellow, "     ensure " + r.PadRight(24) + "NOT INSTALLED (folder not found in resources)");
+                notInstalled = true;
+            }
+            else if (cfgLines == null) Info("     ensure " + r);
+            else if (by != null) Write(ConsoleColor.Green, "     ensure " + r.PadRight(24) + "OK (" + by + ")");
+            else { Write(ConsoleColor.Yellow, "     ensure " + r.PadRight(24) + "NOT FOUND in server.cfg"); allOk = false; }
+        }
+        if (cfgLines == null)
+            Info("   Add these lines to your server.cfg if they are not there yet.\n" +
+                 "   (If you start the whole folder, for example \"ensure [stream]\", you don't need them.)");
+        else if (!allOk)
+            Write(ConsoleColor.Yellow, "   Add the missing lines to " + ctx.ServerCfg);
+        else
+            Info("   Checked: " + ctx.ServerCfg);
+        if (notInstalled)
+            Write(ConsoleColor.Yellow, "   Copy the missing location folder (for example [Hane_MPie_DelPerro]) into your\n" +
+                                       "   server's resources folder, then add its ensure lines.");
+
+        Console.WriteLine();
+        Write(ConsoleColor.White, "2. Apply the change (choose one):");
+        Info("     - Server console or txAdmin Live Console, type:   restart " + BaseResource);
+        Info("     - txAdmin: Resources page > " + BaseResource + " > Restart");
+        Info("     - or simply restart the whole server");
+
+        Console.WriteLine();
+        Write(ConsoleColor.White, "3. Reconnect to the server and go to " + where + ".");
+        Info("   The sign on the building shows the " + (restored ? "original Mom's Pie logo." : "new logo."));
+
+        Console.WriteLine();
+        Write(ConsoleColor.White, "4. Still seeing the old logo?");
+        Info("   Close FiveM, open this folder (paste it in the Explorer address bar):");
+        Info("     %LocalAppData%\\FiveM\\FiveM.app\\data");
+        Info("   delete the \"cache\", \"server-cache\" and \"server-cache-priv\" folders, then reconnect.");
+        Info("   Every player who already visited the server may need to do this once.");
+
+        Console.WriteLine();
+        Write(ConsoleColor.White, "5. " + (restored ? "Want a custom logo again?" : "Not happy with the result?"));
+        if (!restored) Info("   Put another image in " + InputFolder + " and run ReplaceLogo.bat again,");
+        else Info("   Put an image in " + InputFolder + " and run ReplaceLogo.bat.");
+        if (!restored) Info("   or run RestoreOriginalLogo.bat to bring back the original Mom's Pie logo.");
+    }
+
+    static string FindServerCfg(string resourcesRoot)
+    {
+        DirectoryInfo d = new DirectoryInfo(resourcesRoot).Parent;
+        if (d == null) return null;
+        string cfg = Path.Combine(d.FullName, "server.cfg");
+        return File.Exists(cfg) ? cfg : null;
+    }
+
+    static List<string> ServerCfgEnsures(Context ctx)
+    {
+        if (ctx.ServerCfg == null) return null;
+        List<string> res = new List<string>();
+        HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        ReadCfg(ctx.ServerCfg, Path.GetDirectoryName(ctx.ServerCfg), res, seen);
+        return res;
+    }
+
+    static void ReadCfg(string file, string dataDir, List<string> res, HashSet<string> seen)
+    {
+        if (!File.Exists(file) || !seen.Add(Path.GetFullPath(file))) return;
+        foreach (string raw in File.ReadAllLines(file))
+        {
+            string line = raw.Trim();
+            int c = line.IndexOf('#'); if (c >= 0) line = line.Substring(0, c);
+            c = line.IndexOf("//"); if (c >= 0) line = line.Substring(0, c);
+            string[] parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) continue;
+            string cmd = parts[0].ToLowerInvariant();
+            if (cmd == "ensure" || cmd == "start") res.Add(parts[1].Trim('"'));
+            else if (cmd == "exec") ReadCfg(Path.Combine(dataDir, parts[1].Trim('"')), dataDir, res, seen);
+        }
+    }
+
+    static string EnsuredBy(Context ctx, string resource, List<string> ensures)
+    {
+        List<string> names = new List<string>();
+        names.Add(resource);
+        string dir;
+        if (resource.Equals(BaseResource, StringComparison.OrdinalIgnoreCase)) dir = ctx.BasePath;
+        else ctx.FoundResources.TryGetValue(resource, out dir);
+        if (dir != null)
+            for (DirectoryInfo d = new DirectoryInfo(dir).Parent; d != null && !d.FullName.Equals(ctx.ResourcesRoot, StringComparison.OrdinalIgnoreCase); d = d.Parent)
+                if (d.Name.StartsWith("[")) names.Add(d.Name);
+        foreach (string e in ensures)
+            foreach (string n in names)
+                if (e.Equals(n, StringComparison.OrdinalIgnoreCase)) return "ensure " + e;
+        return null;
+    }
+
+    static string StatePath(string toolDir) { return Path.Combine(Path.Combine(toolDir, "_tool"), "state.ini"); }
+
+    static string OriginalBackupPath(Context ctx)
+    {
+        uint h = 2166136261;
+        foreach (char ch in ctx.YtdPath.ToLowerInvariant()) { h ^= ch; h *= 16777619; }
+        string legacy = Path.Combine(Path.Combine(ctx.ToolDir, BackupFolder), "ORIGINAL_" + Path.GetFileName(ctx.YtdPath) + ".bak");
+        string keyed = Path.Combine(Path.Combine(ctx.ToolDir, BackupFolder), "ORIGINAL_" + Path.GetFileName(ctx.YtdPath) + "." + h.ToString("x8") + ".bak");
+        return File.Exists(legacy) && !File.Exists(keyed) ? legacy : keyed;
+    }
+
+    static void SaveState(Context ctx)
+    {
+        try
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("; Remembered by the logo tool. Safe to delete.");
+            if (ctx.BasePath != null) sb.AppendLine("BasePath=" + ctx.BasePath);
+            if (ctx.Selected.Count > 0)
+            {
+                List<string> keys = new List<string>();
+                foreach (Location l in ctx.Selected) keys.Add(l.Key);
+                sb.AppendLine("LastLocation=" + string.Join(",", keys));
+            }
+            else if (ctx.State.ContainsKey("LastLocation")) sb.AppendLine("LastLocation=" + ctx.State["LastLocation"]);
+            File.WriteAllText(StatePath(ctx.ToolDir), sb.ToString());
+        }
+        catch (Exception) { }
+    }
+
+    static Dictionary<string, string> LoadIni(string path)
     {
         Dictionary<string, string> s = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (!File.Exists(path)) return s;
@@ -187,14 +671,44 @@ public static class LogoTool
         return s.TryGetValue(key, out v) && v.Length > 0 ? v : def;
     }
 
-    static void Write(ConsoleColor c, string text)
+    static string Prompt(string text)
+    {
+        Write(ConsoleColor.White, text, false);
+        string line = Console.ReadLine();
+        if (Console.IsInputRedirected && line != null) Console.WriteLine(line);
+        return line;
+    }
+
+    static bool AskYesNo(string question)
+    {
+        for (int i = 0; i < 10; i++)
+        {
+            string a = Prompt(question + " [Y/N]: ");
+            if (a == null) return false;
+            a = a.Trim().ToLowerInvariant();
+            if (a == "y" || a == "yes") return true;
+            if (a == "n" || a == "no" || a == "q") return false;
+        }
+        return false;
+    }
+
+    static void Header(int total, int n, string title)
+    {
+        Console.WriteLine();
+        Write(ConsoleColor.Cyan, "STEP " + n + "/" + total + " - " + title);
+        Write(ConsoleColor.DarkCyan, new string('-', 12 + title.Length));
+    }
+
+    static void Write(ConsoleColor c, string text) { Write(c, text, true); }
+    static void Write(ConsoleColor c, string text, bool newline)
     {
         ConsoleColor old = Console.ForegroundColor;
         Console.ForegroundColor = c;
-        Console.WriteLine(text);
+        if (newline) Console.WriteLine(text); else Console.Write(text);
         Console.ForegroundColor = old;
     }
     static void Step(string t) { Write(ConsoleColor.Cyan, "> " + t); }
+    static void Ok(string t) { Write(ConsoleColor.Green, "  [OK] " + t); }
     static void Info(string t) { Write(ConsoleColor.Gray, t); }
     static void Warn(string t) { Write(ConsoleColor.Yellow, "WARNING: " + t); }
     static void Error(string t) { Write(ConsoleColor.Red, "ERROR: " + t); }

@@ -4,3 +4,4 @@ PUT_YOUR_LOGO_HERE/*
 !PUT_YOUR_LOGO_HERE/put_your_logo_here.txt
 *.tmp
 *.ytd
+_tool/state.ini
