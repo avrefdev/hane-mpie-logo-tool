@@ -1,0 +1,2 @@
+Put your logo image in this folder, then run ReplaceLogo.bat.
+Supported: PNG, JPG, BMP, GIF, TIFF. A PNG with a transparent background works best.
